@@ -19,7 +19,7 @@
 
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-#include "cmsis_os.h"
+
 
 /* Private includes ----------------------------------------------------------*/
 
@@ -46,8 +46,12 @@ UART_HandleTypeDef huart2;
 DMA_HandleTypeDef hdma_usart2_rx;
 DMA_HandleTypeDef hdma_usart2_tx;
 
-osThreadId defaultTaskHandle, LEDThreadHandle;
+osThreadId defaultTaskHandle, LEDThreadHandle, ButtonThreadHandle;
+//static StaticSemaphore_t _button_sem;
+//SemaphoreHandle_t _button_sem_handle = NULL;
+osSemaphoreId osSemaphore;
 
+osSemaphoreId osSemaphore;
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
@@ -59,12 +63,50 @@ static void MX_USART2_UART_Init(void);
 static void MX_CRC_Init(void);
 static void MX_IWDG_Init(void);
 static void MX_TIM3_Init(void);
+
 void StartDefaultTask(void const * argument);
-
 static void LED_Thread(void const *argument);
-
+static void Button_Thread(void const *argument);
 
 /* Private user code ---------------------------------------------------------*/
+///PRINTF
+#ifdef SWO_DEBUG
+	//make sure SWV core clock MHz same as CPU clock.
+	//SWV viewer setting debug port 1 are checked, and started
+
+	int _write(int file, char *ptr, int len)
+	{
+		int i=0;
+		for(i=0; i<len; i++){
+			ITM_SendChar(*ptr++);
+		}
+		return len;
+	}
+
+#else
+	#ifdef __GNUC__
+		/* With GCC, small printf (option LD Linker->Libraries->Small printf set to 'Yes') calls __io_putchar() */
+		#define PUTCHAR_PROTOTYPE int __io_putchar(int ch)
+	#else
+		#define PUTCHAR_PROTOTYPE int fputc(int ch, FILE *f)
+	#endif /* __GNUC__ */
+#endif
+
+#ifndef SWO_DEBUG
+/******************************************************************
+  * @name   PUTCHAR_PROTOTYPE
+  * @brief  Retargets the C library printf function to the USART.
+  *****************************************************************/
+PUTCHAR_PROTOTYPE
+{
+	HAL_UART_Transmit(&huart2, (uint8_t *)&ch, 1, 0xFFFF);				//Use UART2
+	return ch;
+}
+#endif
+
+
+
+
 
 /**
   * @brief  The application entry point.
@@ -90,15 +132,30 @@ int main(void)
   //MX_IWDG_Init();
   MX_TIM3_Init();
 
+#if 1
+  /* Define used semaphore */
+  osSemaphoreDef(SEM);
+
+  /* Create semaphore */
+  osSemaphore = osSemaphoreCreate(osSemaphore(SEM) , 1);
+
+#else
+
+
+#endif
 
   /* Create the thread(s) */
   /* definition and creation of defaultTask */
-  osThreadDef(defaultTask, StartDefaultTask, osPriorityNormal, 0, 128);
+  osThreadDef(defaultTask, StartDefaultTask, osPriorityBelowNormal, 0, 128);
   defaultTaskHandle = osThreadCreate(osThread(defaultTask), NULL);
 
-  /* Thread 1 definition */
-  osThreadDef(LED, LED_Thread, osPriorityNormal, 0, configMINIMAL_STACK_SIZE);
-  LEDThreadHandle = osThreadCreate (osThread(LED), NULL);
+  /* LED Thread definition */
+  osThreadDef(LEDTask, LED_Thread, osPriorityNormal, 0, configMINIMAL_STACK_SIZE);
+  LEDThreadHandle = osThreadCreate (osThread(LEDTask), (void *) osSemaphore);
+
+  /* Button Thread definition */
+  osThreadDef(ButtonTask, Button_Thread, osPriorityNormal, 0, configMINIMAL_STACK_SIZE);
+  ButtonThreadHandle = osThreadCreate (osThread(ButtonTask), (void *) osSemaphore);
 
   /* Start scheduler */
   osKernelStart();
@@ -115,19 +172,20 @@ int main(void)
 
 
 /**
-  * @brief  Toggle LED1 and LED4 thread
+  * @brief  LED thread
   * @param  thread not used
   * @retval None
   */
 static void LED_Thread(void const *argument)
 {
   uint32_t count = 0;
-  (void) argument;
+  osSemaphoreId semaphore = (osSemaphoreId) argument;
 
   for(;;)
   {
     count = 0;
 
+    printf("blink LED for 2S \r\n");
     while (count <= 10)
     {
     	HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
@@ -136,12 +194,41 @@ static void LED_Thread(void const *argument)
     }
 
     /* Turn off LED */
+    printf("turn of LED for 5S \r\n");
     HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_RESET);
+
+    /* Release the semaphore */
+    //osSemaphoreRelease(semaphore);
+
     osDelay(5000);
 
   }
 }
 
+
+
+/**
+  * @brief  Button thread
+  * @param  thread not used
+  * @retval None
+  */
+static void Button_Thread(void const *argument)
+{
+
+  osSemaphoreId semaphore = (osSemaphoreId) argument;
+
+  for(;;)
+  {
+	if (semaphore != NULL)
+	{
+		/* Try to obtain the semaphore. */
+		if(osSemaphoreWait(semaphore , portMAX_DELAY) == osOK){
+			printf("run after interrupt\r\n");
+		}
+	}
+
+  }
+}
 
 
 /**
@@ -372,11 +459,6 @@ static void MX_GPIO_Init(void)
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_RESET);
 
-  /*Configure GPIO pin : B1_Pin */
-  GPIO_InitStruct.Pin 	= B1_Pin;
-  GPIO_InitStruct.Mode 	= GPIO_MODE_IT_FALLING;
-  GPIO_InitStruct.Pull 	= GPIO_NOPULL;
-  HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pin : LD2_Pin */
   GPIO_InitStruct.Pin 	= LD2_Pin;
@@ -385,7 +467,43 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(LD2_GPIO_Port, &GPIO_InitStruct);
 
+
+  /* Enable GPIOC clock */
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+
+  /* Configure PC.13 pin as input floating */
+  GPIO_InitStruct.Mode 	= GPIO_MODE_IT_FALLING;
+  GPIO_InitStruct.Pull 	= GPIO_NOPULL;
+  GPIO_InitStruct.Pin 	= PUSH_BUTTON_PIN;
+  HAL_GPIO_Init(PUSH_BUTTON_PORT, &GPIO_InitStruct);
+
+  /* Enable and set EXTI lines 15 to 10 Interrupt to the lowest priority */
+  HAL_NVIC_SetPriority(EXTI15_10_IRQn, 15, 0);
+  HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
+
 }
+
+
+/************************************************************
+  * @brief EXTI line detection callbacks
+  * @param GPIO_Pin: Specifies the pins connected EXTI line
+  * @retval None
+  ***********************************************************/
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+  if (GPIO_Pin == PUSH_BUTTON_PIN)
+  {
+	  printf("Button INT\r\n");
+
+	  //osSemaphoreRelease(osSemaphore);
+
+	  portBASE_TYPE taskWoken = pdFALSE;
+	  if (xSemaphoreGiveFromISR(osSemaphore, &taskWoken) != pdTRUE) {
+		  printf("Sem Fail\r\n");
+	  }
+  }
+}
+
 
 
 /**
@@ -399,7 +517,7 @@ void StartDefaultTask(void const * argument)
   /* Infinite loop */
   for(;;)
   {
-    osDelay(1);
+    osDelay(1000);
   }
 
 }
